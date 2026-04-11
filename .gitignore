@@ -1,0 +1,42 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environment ────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env
+
+# ── Data — raw downloads and per-date processed folders ──────────────────────
+data/raw/
+data/mibor/
+data/processed/BANKNIFTY/
+# Pre-baked demo parquet (data/processed/iv_surfaces/*.parquet) is intentionally
+# NOT ignored so it can be committed for Streamlit Cloud demo hosting.
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Notebooks — HTML export and checkpoint files ──────────────────────────────
+notebooks/*.html
+notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# ── Claude Code internal ──────────────────────────────────────────────────────
+.claude/
