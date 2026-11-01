@@ -15,19 +15,16 @@ Parameters per slice (5 free):
 
 Why per-slice SVI vs SSVI
 --------------------------
-SSVI ties ATM curvature = theta/2 * phi^2 * (1-rho^2).  When rho→-1 (strong
-put skew, which is normal for BankNifty), curvature→0 and the surface becomes
-a pure monotone skew.  Per-slice SVI separates rho (skew) and sigma (bowl
-depth), so it can simultaneously fit put skew AND call smile.
+SSVI's ATM curvature is θ/2·φ²·(1−ρ²), which vanishes as ρ → −1 (strong put
+skew, typical for BankNifty). Per-slice SVI decouples skew (ρ) from curvature
+(σ), so it can fit put skew and call smile together.
 
-No-arbitrage enforcement
-------------------------
-Calendar no-arb is enforced as a post-fit check (standard industry practice):
-    w_SVI(k, T1) <= w_SVI(k, T2) for all k when T1 < T2.
-This is checked on a fine k-grid and reported in the fit report.
+No-arbitrage
+------------
+Calendar: soft penalty while fitting (slices fitted in T order), then a
+post-fit check that w(k, T1) ≤ w(k, T2) on a k-grid, reported in the fit report.
 """
 
-import math
 import logging
 import numpy as np
 import pandas as pd
@@ -35,59 +32,9 @@ from dataclasses import dataclass, field
 from scipy.optimize import minimize
 from scipy.interpolate import PchipInterpolator
 
+from src.pricing_engines.iv_engines.svi_engine.svi_per_expiry_helpers import SSVIPEHelpers
+
 logger = logging.getLogger(__name__)
-
-
-# ── helpers ────────────────────────────────────────────────────────────────
-
-def _svi_w(k: np.ndarray, a: float, b: float,
-           rho: float, m: float, sigma: float) -> np.ndarray:
-    """Raw SVI total variance."""
-    k    = np.asarray(k, dtype=float)
-    diff = k - m
-    return a + b * (rho * diff + np.sqrt(diff ** 2 + sigma ** 2))
-
-
-def _svi_iv_pct(k: np.ndarray, T: float, a: float, b: float,
-                rho: float, m: float, sigma: float) -> np.ndarray:
-    """SVI implied vol in % units."""
-    w = np.maximum(_svi_w(k, a, b, rho, m, sigma), 1e-12)
-    return np.sqrt(w / max(T, 1e-12)) * 100
-
-
-# ── parameter encoding ─────────────────────────────────────────────────────
-
-def _pack(a: float, b: float, rho: float,
-          m: float, sigma: float) -> np.ndarray:
-    """Encode (a, b, rho, m, sigma) → unconstrained x."""
-    return np.array([
-        math.log(max(a, 1e-12)),           # x0: a = exp(x0) > 0
-        math.log(max(b, 1e-12)),           # x1: b = exp(x1) > 0
-        math.atanh(max(-0.999, min(0.999, rho))),  # x2: rho = tanh(x2)
-        m,                                  # x3: m unconstrained
-        math.log(max(sigma, 1e-12)),        # x4: sigma = exp(x4) > 0
-    ])
-
-
-# Parameter bounds in the raw (unconstrained) space.
-# These translate to: a,b,sigma in [exp(-30), exp(10)] — far wider than
-# any realistic value; m in [-1, 1] (smile centre within ±100% moneyness).
-# The hard clip prevents math.exp overflow (which occurs above ~709) while
-# giving L-BFGS-B unlimited room to roam within the economically valid range.
-_RAW_CLIP = 10.0   # exp(10) ≈ 22000 — safely above any realistic b value
-_M_CLIP   = 1.0
-
-
-def _unpack(x: np.ndarray):
-    """Decode unconstrained x → (a, b, rho, m, sigma).
-    Clips raw params before exp() to prevent math range overflow.
-    """
-    a     = math.exp(float(np.clip(x[0], -30, _RAW_CLIP)))
-    b     = math.exp(float(np.clip(x[1], -30, _RAW_CLIP)))
-    rho   = math.tanh(float(x[2]))
-    m     = float(np.clip(x[3], -_M_CLIP, _M_CLIP))
-    sigma = math.exp(float(np.clip(x[4], -30, _RAW_CLIP)))
-    return a, b, rho, m, sigma
 
 
 # ── per-slice fit result ──────────────────────────────────────────────────
@@ -104,10 +51,7 @@ class SVISliceFit:
     converged: bool  = False
 
     def w(self, k: np.ndarray) -> np.ndarray:
-        return _svi_w(k, self.a, self.b, self.rho, self.m, self.sigma)
-
-    def iv_pct(self, k: np.ndarray) -> np.ndarray:
-        return _svi_iv_pct(k, self.T, self.a, self.b, self.rho, self.m, self.sigma)
+        return SSVIPEHelpers.svi_w(k, self.a, self.b, self.rho, self.m, self.sigma)
 
 
 # ── surface fit result ────────────────────────────────────────────────────
@@ -119,20 +63,10 @@ class SVISurfaceFitReport:
     calendar_violations:  list[str] = field(default_factory=list)
     fit_acceptable:       bool      = True
 
-    def theta_map(self) -> dict:
-        """ATM total variance per expiry (w at k=0)."""
-        return {s.T: s.w(np.array([0.0]))[0] for s in self.slice_fits}
-
 
 # ── main fitter ────────────────────────────────────────────────────────────
 
 class SVIPerExpiryFitter:
-    # Minimum sigma (ATM curvature parameter).
-    # sigma=0 collapses SVI to a pure linear skew — losing all smile bowl — and
-    # creates calendar arb when adjacent slices have opposite rho signs.
-    # A floor of 0.02 corresponds to ~2 vol pts of ATM curvature at T=0.08,
-    # which is economically negligible but prevents the degenerate state.
-    SIGMA_MIN: float = 0.02
     """
     Fits raw SVI independently to each expiry slice then checks calendar no-arb.
 
@@ -143,11 +77,14 @@ class SVIPerExpiryFitter:
     iv_svi_df = fitter.build_surface_df()
     """
 
-    # Calendar no-arb check grid
+    # Floor on sigma: sigma → 0 collapses the smile to a kinked linear skew
+    SIGMA_MIN: float = 0.02
+
+    # Post-fit calendar check grid
     _CAL_K_GRID = np.linspace(-0.15, 0.15, 121)
 
     def __init__(self, iv_df: pd.DataFrame):
-        # Use the same rows that SSVI uses for a fair comparison
+        # Same rows as SSVI, for a like-for-like comparison
         if "iv_valid_for_ssvi" in iv_df.columns:
             df = iv_df[iv_df["iv_valid_for_ssvi"]].copy()
         else:
@@ -162,26 +99,26 @@ class SVIPerExpiryFitter:
     # ── single-slice fit ──────────────────────────────────────────────────
 
     def _fit_slice(self, T: float, prev_fits: list = None) -> SVISliceFit:
-        g    = self.df[self.df["time_to_expiry"] == T].sort_values("log_moneyness")
-        k    = g["log_moneyness"].values
-        w_obs = g["bs_implied_variance"].values
+        g     = self.df[self.df["time_to_expiry"] == T].sort_values("log_moneyness")
+        k     = g["log_moneyness"].values
+        w_obs  = g["bs_implied_variance"].values
         iv_obs = g["implied_volatility"].values   # in % units
 
         if len(k) < 5:
             # Too few points — return a flat surface at ATM level
-            idx    = np.argmin(np.abs(k))
-            w_atm  = max(float(w_obs[idx]), 1e-6)
-            return SVISliceFit(T=T, a=w_atm, b=1e-4, rho=0.0, m=0.0, sigma=SVIPerExpiryFitter.SIGMA_MIN,
+            idx   = np.argmin(np.abs(k))
+            w_atm = max(float(w_obs[idx]), 1e-6)
+            return SVISliceFit(T=T, a=w_atm, b=1e-4, rho=0.0, m=0.0,
+                               sigma=SVIPerExpiryFitter.SIGMA_MIN,
                                rmse_vpts=np.nan, converged=False)
 
         # ── initial guess ────────────────────────────────────────────────
         idx_atm = np.argmin(np.abs(k))
         a0      = max(float(w_obs[idx_atm]) * 0.9, 1e-6)
-        # b: slope of w vs k in the put region
+        # b0: put-wing slope of w vs k, clamped (polyfit is noisy)
         put_mask = k < -0.01
         if put_mask.sum() >= 2:
             slope = float(np.polyfit(k[put_mask], w_obs[put_mask], 1)[0])
-            # Clamp slope: polyfit can produce huge values on noisy data
             b0 = float(np.clip(slope, 1e-4, 0.5))
         else:
             b0 = 0.01
@@ -189,66 +126,43 @@ class SVIPerExpiryFitter:
         m0     = 0.0
         sigma0 = max(float(np.std(k)) * 0.5, SVIPerExpiryFitter.SIGMA_MIN)
 
-        x0 = _pack(a0, b0, rho0, m0, sigma0)
+        x0 = SSVIPEHelpers.pack(a0, b0, rho0, m0, sigma0)
 
-        # ── no-arb soft constraints ──────────────────────────────────────
-        # SVI butterfly no-arb: b*(1+|rho|) <= 1  (Lee 2004 wing condition)
-        # We enforce this as a soft penalty.
-        def penalty(b, rho):
-            val = b * (1 + abs(rho))
-            return 1e4 * max(0.0, val - 1.0) ** 2
-
-        # ── objective: MSE in vol-point space ────────────────────────────
-        # (same reasoning as SSVI: w-space gradients too small for optimizer)
-        # Calendar check grid — finer than the post-fit check grid
+        # ── objective: MSE in vol points (already O(1), weights expiries equally)
         k_cal = np.linspace(-0.15, 0.15, 61)
 
         def obj(x):
-            a, b, rho, m, sigma = _unpack(x)
-            # hard reject: negative w at any observed k
-            w_model = _svi_w(k, a, b, rho, m, sigma)
+            a, b, rho, m, sigma = SSVIPEHelpers.unpack(x)
+            w_model = SSVIPEHelpers.svi_w(k, a, b, rho, m, sigma)
             if np.any(w_model <= 0):
                 return 1e20
             iv_model = np.sqrt(np.maximum(w_model / max(T, 1e-12), 0)) * 100
-            mse  = float(np.mean((iv_model - iv_obs) ** 2))
-            pen  = penalty(b, rho)
-            # Soft calendar no-arb penalty: penalise w(T_current) < w(T_prev) at any k.
-            # Total variance must be non-decreasing in T — this is the calendar spread
-            # no-arb condition. Each prior slice contributes a quadratic penalty.
-            # Coefficient 50 is chosen so a 0.001 w-violation costs ~0.05 extra MSE
-            # (same order as a 1 vol-pt fit error), keeping the fit-vs-arb balance.
-            if prev_fits:
-                cal_pen = 0.0
-                w_curr = _svi_w(k_cal, a, b, rho, m, sigma)
-                for pf in prev_fits:
-                    w_prev = pf.w(k_cal)
-                    violations = np.maximum(0.0, w_prev - w_curr)
-                    cal_pen += 50.0 * float(np.mean(violations ** 2))
-                pen += cal_pen
-            # Also penalise negative w at extended wings
+            mse = float(np.mean((iv_model - iv_obs) ** 2))
+            pen = SSVIPEHelpers.butterfly_penalty(b, rho)
+            pen += SSVIPEHelpers.calendar_penalty(k_cal, a, b, rho, m, sigma, prev_fits or [])
+            # Negative w in the extended wings
             k_ext = np.linspace(-0.20, 0.20, 41)
-            w_ext = _svi_w(k_ext, a, b, rho, m, sigma)
+            w_ext = SSVIPEHelpers.svi_w(k_ext, a, b, rho, m, sigma)
             if np.any(w_ext <= 0):
                 pen += 1e4
             return mse + pen
 
-        # Parameter bounds: keep raw values in a safe range.
-        # Translated: a,b,sigma in [exp(-30), exp(10)]; rho in (-1,1); m in [-1, 1].
-        _B  = _RAW_CLIP
+        # Bounds in raw space: a, b, sigma ∈ [e^-30, e^10]; rho ∈ (-1, 1); m ∈ [-1, 1]
+        _RC = SSVIPEHelpers.RAW_CLIP
+        _MC = SSVIPEHelpers.M_CLIP
         bounds = [
-            (-30,  _B),    # x0 → a
-            (-30,  _B),    # x1 → b
-            (-10,  10),    # x2 → rho (tanh maps this to (-1, 1))
-            (-_M_CLIP, _M_CLIP),   # x3 → m
-            (-30,  _B),    # x4 → sigma
+            (-30,  _RC),          # x0 → a
+            (-30,  _RC),          # x1 → b
+            (-10,  10),           # x2 → rho
+            (-_MC, _MC),          # x3 → m
+            (-30,  _RC),          # x4 → sigma
         ]
         res = minimize(obj, x0, method="L-BFGS-B", bounds=bounds,
                        options={"maxiter": 3000, "ftol": 1e-14, "gtol": 1e-8})
 
-        a, b, rho, m, sigma = _unpack(res.x)
+        a, b, rho, m, sigma = SSVIPEHelpers.unpack(res.x)
 
-        # Compute RMSE
-        w_fitted  = _svi_w(k, a, b, rho, m, sigma)
+        w_fitted  = SSVIPEHelpers.svi_w(k, a, b, rho, m, sigma)
         iv_fitted = np.sqrt(np.maximum(w_fitted / max(T, 1e-12), 0)) * 100
         rmse      = float(np.sqrt(np.mean((iv_fitted - iv_obs) ** 2)))
 
@@ -263,7 +177,7 @@ class SVIPerExpiryFitter:
             rmse_vpts=rmse, converged=res.success,
         )
 
-    # ── calendar no-arb check ────────────────────────────────────────────
+    # ── calendar no-arb check ─────────────────────────────────────────────
 
     def _check_calendar_arb(self) -> list[str]:
         """
@@ -289,11 +203,10 @@ class SVIPerExpiryFitter:
             logger.info("[SVI cal] No calendar spread arbitrage detected")
         return violations
 
-    # ── public fit ───────────────────────────────────────────────────────
+    # ── public fit ────────────────────────────────────────────────────────
 
     def fit(self) -> SVISurfaceFitReport:
-        # Fit slices sequentially so each can apply the calendar penalty
-        # against all previously fitted slices.
+        # Sequential in T so each slice is penalised against the earlier ones
         self.slice_fits = []
         for T in self.time_to_expiry:
             fit = self._fit_slice(T, prev_fits=list(self.slice_fits))
@@ -316,7 +229,7 @@ class SVIPerExpiryFitter:
         self.report = report
         return report
 
-    # ── surface builders ─────────────────────────────────────────────────
+    # ── surface builders ──────────────────────────────────────────────────
 
     def build_surface_df(
         self,
@@ -339,13 +252,9 @@ class SVIPerExpiryFitter:
             expiries,
         )))
 
-        k_grid = self.log_moneyness_grid if hasattr(self, "log_moneyness_grid") else \
-                 np.unique(np.concatenate((
-                     np.linspace(-0.20, 0.20, 81),
-                     self.df["log_moneyness"].values,
-                 )))
+        k_grid = self.log_moneyness_grid
 
-        # Interpolate SVI params across T using PCHIP on each parameter
+        # Interpolate each SVI parameter across T with PCHIP
         fits_sorted = sorted(self.slice_fits, key=lambda s: s.T)
         Ts     = np.array([s.T     for s in fits_sorted])
         as_    = np.array([s.a     for s in fits_sorted])
@@ -379,9 +288,7 @@ class SVIPerExpiryFitter:
             w_row  = np.maximum(a + b * (rho * diff + root), 1e-12)
             iv_row = np.sqrt(w_row / max(T, 1e-12)) * 100
 
-            # Analytical derivatives
-            # dw/dk  = b * (rho + diff/root)
-            # d2w/dk2 = b * sigma^2 / root^3
+            # Analytical: w_k = b(ρ + (k−m)/root),  w_kk = b·σ²/root³
             wk_row  = b * (rho + diff / root)
             wkk_row = b * sigma ** 2 / root ** 3
 
@@ -392,23 +299,24 @@ class SVIPerExpiryFitter:
             rows_wk.extend(wk_row.tolist())
             rows_wkk.extend(wkk_row.tolist())
 
-        # dw/dT: numerical differentiation over T_grid
+        # w_T: numerical gradient over T_grid
         w_matrix = np.array(rows_w).reshape(len(T_grid), nk)
         dw_dT    = np.gradient(w_matrix, T_grid, axis=0)
 
         for i in range(len(T_grid)):
-            w_row  = w_matrix[i]
-            wt_row = dw_dT[i]
-            wk_row = np.array(rows_wk[i*nk:(i+1)*nk])
+            w_row   = w_matrix[i]
+            wt_row  = dw_dT[i]
+            wk_row  = np.array(rows_wk[i*nk:(i+1)*nk])
             wkk_row = np.array(rows_wkk[i*nk:(i+1)*nk])
 
+            # Gatheral (2006) eq. 1.10 — same D as the SSVI builder; D <= 0 → sigma_floor
+            # D = (1 - k*w_k/(2w))^2 - (w_k^2/4)*(1/w + 1/4) + w_kk/2
             w_safe = np.maximum(w_row, 1e-12)
-            T_val  = T_grid[i]
             term1  = 1.0 - (k_grid * wk_row) / (2.0 * w_safe)
             term2  = 0.25 * wk_row ** 2 * (1.0 / w_safe + 0.25)
-            D      = np.maximum(term1 ** 2 + term2, 1e-12)
+            D      = term1 ** 2 - term2 + 0.5 * wkk_row
 
-            lvar   = wt_row / D
+            lvar   = np.where(D > 1e-12, wt_row / np.maximum(D, 1e-12), np.nan)
             lvar   = np.where(np.isfinite(lvar) & (lvar > 0), lvar, sigma_floor ** 2)
             lvar   = np.maximum(lvar, sigma_floor ** 2)
             lv     = np.sqrt(lvar) * 100

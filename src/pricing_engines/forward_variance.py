@@ -9,17 +9,20 @@ Calendar no-arbitrage requires total implied variance  W(k, T) = σ²(k, T)·T
 to be non-decreasing in T for every k.  The **forward total variance** between
 two expiries T₁ < T₂ at moneyness k is:
 
-    f(k; T₁, T₂) = [W(k, T₂)·T₂ − W(k, T₁)·T₁] / (T₂ − T₁)
+    f(k; T₁, T₂) = W(k, T₂) − W(k, T₁)
 
+and the annualised forward vol is  σ_fwd = √(f / (T₂ − T₁)).
+
+W is already total variance (σ²·T), so it must NOT be multiplied by T again.
 For SSVI/SVI-pe surfaces ``W = implied_variance_svi`` (already in the parquet).
 
 Properties
 ----------
-- f > 0 everywhere  ↔  no calendar arbitrage
-- f = W(k, T)  when T₁ → T  (forward variance equals spot variance at a
-  single expiry)
-- The ATM forward variance (k=0) equals the variance of the forward starting
-  ATM straddle, making it directly tradeable via variance swaps
+- f ≥ 0 everywhere  ↔  no calendar arbitrage (at fixed log-forward moneyness)
+- f / (T₂ − T₁) → ∂W/∂T  as T₂ → T₁  (the numerator of Dupire's formula)
+- Flat term structure σ(k, T) = σ  ⇒  σ_fwd = σ
+- Integrated across strikes, forward variance is what a forward-starting
+  variance swap trades; the per-k value is the smile analogue
 
 Usage
 -----
@@ -105,7 +108,7 @@ def compute_forward_variance(
         W2  = W_by_T[T2]
         dT  = T2 - T1
 
-        fv          = (W2 * T2 - W1 * T1) / dT
+        fv          = W2 - W1                     # forward total variance
         fv_floored  = np.where(fv > 0, fv, 0.0)   # floor at 0 for vol calc
         fwd_vol     = np.sqrt(fv_floored / dT)
 

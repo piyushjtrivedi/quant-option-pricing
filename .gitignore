@@ -40,3 +40,5 @@ notebooks/.ipynb_checkpoints/
 
 # ── Claude Code internal ──────────────────────────────────────────────────────
 .claude/
+
+notebooks/

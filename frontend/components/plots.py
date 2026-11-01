@@ -328,12 +328,8 @@ def plot_smile_slices(df: pd.DataFrame) -> go.Figure:
     rows_cfg.append(("dupire_local_volatility", "Local Vol", _C["lv"], "lines"))
 
     n_rows = len(rows_cfg)
-    ncols  = min(n_exp, 4)
-    nrows_grid = n_rows * ((n_exp + ncols - 1) // ncols)
 
-    # Build flat subplot grid: n_rows model rows × n_exp_cols expiry cols
-    # But reorganise as: for each expiry panel, stack the 4 model rows vertically
-    # Use n_rows × n_exp grid directly
+    # Grid: one row per model, one column per expiry
     fig = make_subplots(
         rows=n_rows, cols=n_exp,
         subplot_titles=[_lbl(T) for T in expiries],
@@ -421,7 +417,6 @@ def plot_skew_profile(df: pd.DataFrame) -> go.Figure:
 
     sk    = pd.DataFrame(records)
     clrs  = {"SSVI": _C["ssvi"], "SVI": _C["svi_pe"]}
-    days  = sorted(sk["days"].unique())
 
     fig = make_subplots(
         rows=2, cols=1,

@@ -8,13 +8,8 @@ from src.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-# ── RBI Excel filename ────────────────────────────────────────────────────────
-# The RBI publishes a historical MIBOR/MIBID Excel file on data.rbi.org.in.
-# Downloading it programmatically requires an authenticated SAP BusinessObjects
-# session (enterprise login). Until that is implemented, place the manually
-# downloaded file in data/raw/ with the exact filename below.
-# Future: _download_rbi_excel() will use Playwright to log in and trigger the
-# export, saving it to this same path automatically.
+# RBI MIBOR/MIBID history from data.rbi.org.in. Download needs an authenticated
+# session, so place the file manually in data/raw/ under this exact name.
 _RBI_EXCEL_FILENAME = (
     "Mumbai Inter-Bank Offer Rate (MIBOR) & Mumbai Inter-Bank Bid Rate (MIBID).xlsx"
 )
@@ -30,13 +25,10 @@ _DATE_COL          = 1   # column index holding the date
 
 class SpotRateClient:
     """
-    Provides MIBOR interest rates for a given date using a two-tier lookup:
+    MIBOR rates for a date, two-tier lookup:
 
-      1. Local  — consolidated mibor.csv (data/mibor/mibor.csv).
-                  All successful fetches are written here; most lookups hit here.
-      2. RBI Excel — reads the RBI historical Excel from data/raw/ and bulk-loads
-                     all MIBOR tenor rates into mibor.csv.  Place the manually
-                     downloaded file at data/raw/<_RBI_EXCEL_FILENAME>.
+      1. data/mibor/mibor.csv (local cache)
+      2. RBI Excel in data/raw/ — bulk-loaded into mibor.csv, then re-checked
 
     Columns stored: displayTime | tenor | years | yield
     Sorted by: displayTime ASC, years ASC
@@ -157,36 +149,13 @@ class SpotRateClient:
         combined.to_csv(self._mibor_file, index=False)
         logger.info("[SpotRateClient] mibor.csv updated — %d total rows", len(combined))
 
-    def _excel_latest_date(self) -> date_type | None:
-        """
-        Return the latest date already ingested from the Excel into mibor.csv,
-        without re-parsing the Excel.  Used to skip redundant re-parsing when
-        the requested date is clearly beyond the Excel's coverage.
-        Returns None if mibor.csv does not exist or is empty.
-        """
-        if not os.path.exists(self._mibor_file):
-            return None
-        df = self._read_file()
-        return df["displayTime"].max() if not df.empty else None
-
     # ── Tier 2: RBI Excel parser ──────────────────────────────────────────────
 
     def _load_rbi_excel(self) -> pd.DataFrame:
         """
-        Parse the RBI MIBOR/MIBID Excel file from data/raw/ and return a
-        long-format DataFrame with columns [displayTime, tenor, years, yield]
-        containing only MIBOR Rate values (MIBID is excluded).
-
-        Excel layout (0-based row indices):
-          Row 3 — tenor group headers: OVERNIGHT, 14 DAYS, 1 MONTHS, 3 MONTHS
-          Row 4 — MIBID / MIBOR per tenor group
-          Row 5 — Rate / Standard Deviation sub-headers
-          Row 6+ — date (col 1) + rate data
-
-        Only MIBOR Rate columns are extracted (MIBID and Std Dev are dropped).
-
-        Future: replace this with _download_rbi_excel() once Playwright-based
-        RBI portal login is implemented.
+        Parse the RBI Excel into long format [displayTime, tenor, years, yield],
+        keeping MIBOR Rate columns only (MIBID and Std Dev dropped).
+        Sheet layout is described by the _HEADER_ROW_* constants above.
         """
         excel_path = Path(self._raw_dir) / _RBI_EXCEL_FILENAME
         if not excel_path.exists():
@@ -204,17 +173,12 @@ class SpotRateClient:
             engine="openpyxl",
         )
 
-        # ── Build column map: col_index → (tenor_label, field_type) ──────────
-        # Row 3 has tenor group labels at the leftmost column of each group.
-        # Row 4 has MIBID/MIBOR repeated within each group.
-        # Row 5 has Rate/Standard Deviation alternating within each MIBID/MIBOR.
-        # We propagate tenor and type labels forward to fill merged-cell gaps.
-
+        # ── Build column map: col_index → (tenor, type, field) ───────────────
         tenor_row = raw.iloc[_HEADER_ROW_TENOR].tolist()
         type_row  = raw.iloc[_HEADER_ROW_TYPE].tolist()
         field_row = raw.iloc[_HEADER_ROW_FIELD].tolist()
 
-        # Forward-fill tenor and type to cover merged cells (NaN = merged)
+        # Tenor and type headers are merged cells (NaN) — forward-fill them
         current_tenor = None
         current_type  = None
         col_meta = {}   # col_idx → {"tenor": str, "type": str, "field": str}

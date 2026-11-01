@@ -10,7 +10,7 @@ class BhavcopyParser:
     def __init__(self, symbol, instrument_type):
         self.symbol = symbol
         self.instrument_type = instrument_type
-        # Cache the raw CSV so a second call with the same path avoids re-reading disk
+        # Raw CSV cache: one disk read per path
         self._csv_path: str | None = None
         self._raw_df: pd.DataFrame | None = None
 
@@ -50,10 +50,8 @@ class BhavcopyParser:
 
         df = df.merge(f_df, on=["XpryDt"], how="left")
 
-        # Drop options whose expiry has no corresponding futures contract.
-        # Without a futures price there is no forward, so log_moneyness = log(K/F)
-        # is undefined. These are typically quarterly expiries (Jun/Sep/Dec) that
-        # are structurally illiquid and would corrupt the SSVI fit.
+        # No futures → no forward → log(K/F) undefined. Typically illiquid
+        # quarterly expiries that would corrupt the surface fit.
         n_before = len(df)
         df = df[df["futures_close"].notna()]
         n_dropped = n_before - len(df)
@@ -66,7 +64,6 @@ class BhavcopyParser:
         df["time_to_expiry"] = (
             (pd.to_datetime(df["XpryDt"]) - pd.to_datetime(df["TradDt"])).dt.days / 365
         )
-        df["moneyness"]     = df["StrkPric"] / df["UndrlygPric"]
         df["log_moneyness"] = np.log(df["StrkPric"] / df["futures_close"])
         df["pay_off"] = np.where(
             df["OptnTp"] == "CE",
@@ -80,7 +77,7 @@ class BhavcopyParser:
         df = df[[
             "TckrSymb", "TradDt", "XpryDt", "StrkPric", "OptnTp",
             "ClsPric", "TtlTradgVol", "OpnIntrst", "UndrlygPric",
-            "time_to_expiry", "moneyness", "log_moneyness",
+            "time_to_expiry", "log_moneyness",
             "pay_off", "futures_close", "cost_of_carry",
         ]].rename(columns={
             "TckrSymb":    "ticker",

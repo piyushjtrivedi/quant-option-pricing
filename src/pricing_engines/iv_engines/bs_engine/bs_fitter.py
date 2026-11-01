@@ -1,8 +1,6 @@
 import logging
-import math
 import numpy as np
 import pandas as pd
-from src.pricing_engines.bs_pricer import BlackScholes
 from src.pricing_engines.iv_engines.bs_engine.iv_bs import BSIV
 from scipy.interpolate import PchipInterpolator
 
@@ -10,31 +8,24 @@ logger = logging.getLogger(__name__)
 
 pd.set_option('display.float_format', '{:.6f}'.format)
 
-# Module-level vectorised wrappers — created once, reused every call.
-# np.vectorize avoids pandas .apply() overhead while keeping the scalar
-# BlackScholes implementation unchanged (it has scalar if-guards).
-_bs_price_vec = np.vectorize(BlackScholes.bs_price)
-_bs_vega_vec  = np.vectorize(BlackScholes.bs_vega)
-
 
 class BSFitter:
 
     @staticmethod
     def fit(df: pd.DataFrame, nss_fitted_curve, dividend_fitter):
         """
-        Full BS IV calibration pipeline:
-          1. Compute r(T) and q(T) vectorised per unique expiry
-          2. Compute raw BS IV per row (Newton+bisection) → NaN for failures
-          3. Interpolate NaN IVs within each (option_type, expiry) slice
-             using PCHIP on the valid neighbours in log-moneyness space
-          4. Mark iv_interpolated flag so downstream knows which are real vs filled
-          5. Derive bs_vega, bs_implied_variance on all valid rows
-          6. Add static arbitrage diagnostics (butterfly + calendar)
+        BS IV calibration:
+          1. Map r(T) and q(T) onto each row
+          2. Raw BS IV per row (Newton + bisection); NaN on failure
+          3. PCHIP gap-fill within each (option_type, expiry) slice → iv_interpolated
+          4. Total implied variance w = σ²·T
+          5. iv_valid_for_ssvi: raw, OTM, |k| ≤ K_MAX
+          6. Static arbitrage diagnostics (butterfly + calendar)
         """
         oc_df = df.copy()
 
         # ------------------------------------------------------------------
-        # 1. Vectorised r(T) and q(T) — one call per unique expiry
+        # 1. r(T) and q(T) — one call per unique expiry
         # ------------------------------------------------------------------
         unique_expiries = oc_df["time_to_expiry"].unique()
         r_map = {T: float(nss_fitted_curve(T)) / 100 for T in unique_expiries}
@@ -44,7 +35,7 @@ class BSFitter:
         oc_df["dividend"]      = oc_df["time_to_expiry"].map(q_map)
 
         # ------------------------------------------------------------------
-        # 2. Raw BS IV — array-based loop (avoids iterrows overhead)
+        # 2. Raw BS IV — only where the price has time value
         # ------------------------------------------------------------------
         prices  = oc_df["close"].values
         S_arr   = oc_df["underlying_value"].values
@@ -69,48 +60,19 @@ class BSFitter:
         oc_df["iv_interpolated"]    = False
 
         # ------------------------------------------------------------------
-        # 3. Interpolate NaN IVs within each (option_type, expiry) slice
+        # 3. Gap-fill NaN IVs within each (option_type, expiry) slice
         # ------------------------------------------------------------------
         oc_df = BSFitter._interpolate_iv_gaps(oc_df)
 
         # ------------------------------------------------------------------
-        # 4. iv_valid_for_ssvi — raw, non-interpolated only
+        # 4. Total implied variance w = σ²·T  (0 where IV is missing)
         # ------------------------------------------------------------------
-        oc_df["iv_valid_for_ssvi"] = (
-            ~oc_df["iv_interpolated"]
-            & oc_df["implied_volatility"].notna()
-            & (oc_df["implied_volatility"] > 0)
-        )
+        iv_pct = oc_df["implied_volatility"].values
+        valid  = ~np.isnan(iv_pct) & (iv_pct > 0)
+        oc_df["bs_implied_variance"] = np.where(valid, np.square(np.where(valid, iv_pct, 0.0) / 100) * T_arr, 0.0)
 
         # ------------------------------------------------------------------
-        # 5. Greeks and implied variance — vectorised via np.vectorize
-        # ------------------------------------------------------------------
-        valid      = oc_df["implied_volatility"].notna().values & (oc_df["implied_volatility"].values > 0)
-        sigma_arr  = np.where(valid, oc_df["implied_volatility"].values / 100, np.nan)
-        flag_arr   = np.where(oc_df["option_type"].values == "CE", "c", "p")
-
-        bs_prices = np.where(
-            valid,
-            _bs_price_vec(S_arr, K_arr, r_arr, q_arr, T_arr, sigma_arr, flag_arr),
-            oc_df["pay_off"].values,
-        )
-        bs_vegas = np.where(
-            valid,
-            _bs_vega_vec(S_arr, K_arr, r_arr, q_arr, T_arr, sigma_arr),
-            0.0,
-        )
-        bs_var = np.where(
-            valid,
-            np.square(np.where(valid, oc_df["implied_volatility"].values / 100, 0.0)) * T_arr,
-            0.0,
-        )
-
-        oc_df["bs_price"]           = bs_prices
-        oc_df["bs_vega"]            = bs_vegas
-        oc_df["bs_implied_variance"] = bs_var
-
-        # ------------------------------------------------------------------
-        # 6. OTM-only + moneyness cap for SSVI fitting
+        # 5. Rows the surface models fit to: raw (not gap-filled), OTM, |k| ≤ K_MAX
         # ------------------------------------------------------------------
         is_otm_call = (oc_df["option_type"] == "CE") & (oc_df["log_moneyness"] >= 0)
         is_otm_put  = (oc_df["option_type"] == "PE") & (oc_df["log_moneyness"] <= 0)
@@ -118,50 +80,16 @@ class BSFitter:
         in_zone     = oc_df["log_moneyness"].abs() <= K_MAX
 
         oc_df["iv_valid_for_ssvi"] = (
-            oc_df["iv_valid_for_ssvi"]
+            ~oc_df["iv_interpolated"]
+            & valid
             & (is_otm_call | is_otm_put)
             & in_zone
         )
 
         # ------------------------------------------------------------------
-        # 7. Static arbitrage diagnostics
+        # 6. Static arbitrage diagnostics
         # ------------------------------------------------------------------
         return BSFitter.add_static_arbitrage_diagnostics(oc_df)
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def interpolate_bs_iv_onto_svi_grid(
-        iv_bs_df: pd.DataFrame, iv_svi_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """
-        Interpolate BS IV from traded strikes onto the denser SSVI k-grid.
-        Uses PCHIP per (option_type, expiry) slice. No extrapolation.
-        """
-        iv_svi_df = iv_svi_df.copy()
-        iv_svi_df["implied_volatility_bs_grid"] = np.nan
-        n_filled = 0
-
-        for (opt_type, T), group in iv_bs_df.groupby(["option_type", "time_to_expiry"]):
-            g = group.dropna(subset=["implied_volatility"]).sort_values("log_moneyness")
-            if len(g) < 3:
-                continue
-            pchip = PchipInterpolator(
-                g["log_moneyness"].values,
-                g["implied_volatility"].values,
-                extrapolate=False,
-            )
-            svi_slice = iv_svi_df[np.isclose(iv_svi_df["time_to_expiry"], T)]
-            k_svi     = svi_slice["log_moneyness"].values
-            iv_interp = pchip(k_svi)
-            valid     = ~np.isnan(iv_interp)
-            iv_svi_df.loc[svi_slice.index[valid], "implied_volatility_bs_grid"] = iv_interp[valid]
-            n_filled += int(valid.sum())
-
-        logger.info(
-            "[BSGrid] Interpolated BS IV onto SSVI grid: %d / %d points filled",
-            n_filled, len(iv_svi_df),
-        )
-        return iv_svi_df
 
     # ------------------------------------------------------------------
     @staticmethod

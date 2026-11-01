@@ -20,14 +20,13 @@ class SSVIFitReport:
     Returned by SSVIValidator.check_fit_quality().
     All vol figures in percentage points (e.g. 1.2 means 1.2 vol pts).
     """
-    overall_rmse_vpts:  float                       # global RMSE in vol points
+    overall_rmse_vpts:  float
     per_expiry_rmse:    dict[float, float]          # {T: rmse_vpts}
-    max_residual_vpts:  float                       # worst single point
-    fit_acceptable:     bool                        # True if overall_rmse <= threshold
+    max_residual_vpts:  float
+    fit_acceptable:     bool                        # overall_rmse <= RMSE_WARN_THRESHOLD_VPTS
     gj_violations:      list[str] = field(default_factory=list)
-    # SSVI−SVI gap: large gap = SSVI structurally failing = smile non-linear = stress indicator
-    ssvi_svi_gap_vpts:  float = np.nan
-    smile_stress_flag:  bool  = False   # True when gap >= SMILE_STRESS_THRESHOLD
+    ssvi_svi_gap_vpts:  float = np.nan              # SSVI RMSE − SVI RMSE
+    smile_stress_flag:  bool  = False               # gap >= SMILE_STRESS_THRESHOLD
 
     def log(self):
         status = "✅ PASS" if self.fit_acceptable else "⚠️  WARN"
@@ -45,31 +44,21 @@ class SSVIFitReport:
 
 class SSVIValidator:
 
-    RMSE_WARN_THRESHOLD_VPTS:  float = 1.5   # warn if overall RMSE > 1.5 vol points
-    # SSVI−SVI gap threshold for smile stress flag.
-    # From the multi-date analysis: gap is ~0.7 on normal days, ~1.9 on stress days.
-    # A threshold of 1.2 sits between the two regimes.
-    SMILE_STRESS_THRESHOLD:    float = 1.2   # vol points
+    RMSE_WARN_THRESHOLD_VPTS:  float = 1.5
+    # Heuristic. With constant-φ SSVI the gap exceeds this on most dates,
+    # so the flag mostly reflects SSVI's structural limit. TODO: recalibrate.
+    SMILE_STRESS_THRESHOLD:    float = 1.2
 
     # ------------------------------------------------------------------ #
     @staticmethod
     def check_fit_quality(
         iv_bs_df:    pd.DataFrame,
         ssvi_params: dict,
-        ssvi_fitter,
-        svi_rmse_vpts: float = np.nan,   # pass SVI RMSE to compute gap
+        svi_rmse_vpts: float = np.nan,
     ) -> SSVIFitReport:
         """
-        Compare fitted SSVI IV against observed BS IV (raw, non-interpolated only).
-
-        Args:
-            iv_bs_df:    DataFrame with 'implied_volatility', 'log_moneyness',
-                         'time_to_expiry', 'iv_valid_for_ssvi'
-            ssvi_params: dict with theta_map, phi, rho
-            ssvi_fitter: SSVIConstrainedFitter instance (for ssvi_w helper)
-
-        Returns:
-            SSVIFitReport
+        SSVI vs observed BS IV on iv_valid_for_ssvi rows, GJ checks, and the
+        SSVI−SVI gap (when svi_rmse_vpts is given). ssvi_params: theta_map, phi, rho.
         """
         from src.pricing_engines.iv_engines.svi_engine.ssvi_helpers import SSVIHelpers
 
@@ -115,12 +104,9 @@ class SSVIValidator:
         max_res            = float(np.max(np.abs(residuals_arr)))        if len(residuals_arr) else np.nan
         fit_ok             = overall_rmse <= SSVIValidator.RMSE_WARN_THRESHOLD_VPTS
 
-        # Gatheral-Jacquier conditions
         gj_violations = SSVIValidator._check_gj_conditions(ssvi_params)
 
-        # SSVI−SVI gap: measures how much non-linearity the smile has.
-        # Large gap = SSVI structurally failing = market in a fear/stress regime.
-        gap        = (overall_rmse - svi_rmse_vpts
+        gap        =(overall_rmse - svi_rmse_vpts
                       if not np.isnan(svi_rmse_vpts) else np.nan)
         stress_flag = (not np.isnan(gap) and
                        gap >= SSVIValidator.SMILE_STRESS_THRESHOLD)
@@ -144,8 +130,8 @@ class SSVIValidator:
         Gatheral-Jacquier (2014) no-arbitrage conditions.
 
         For each expiry with ATM total variance θ:
-            (1)  φ·θ·(1+|ρ|) ≤ 4      [wing condition]
-            (2)  φ²·(1+|ρ|)   ≤ 4      [butterfly condition]
+            (1)  θ·φ·(1+|ρ|)  ≤ 4      [wing condition]
+            (2)  θ·φ²·(1+|ρ|) ≤ 4      [butterfly condition]
         """
         theta_map = ssvi_params["theta_map"]
         phi       = ssvi_params["phi"]
@@ -155,7 +141,7 @@ class SSVIValidator:
 
         for T, theta in theta_map.items():
             wing_lhs      = phi * theta * (1 + abs_rho)
-            butterfly_lhs = phi ** 2    * (1 + abs_rho)
+            butterfly_lhs = theta * phi ** 2 * (1 + abs_rho)
 
             if wing_lhs > 4.0:
                 msg = (f"T={T:.4f}: wing violated — φ·θ·(1+|ρ|) = {wing_lhs:.4f} > 4")
@@ -163,7 +149,7 @@ class SSVIValidator:
                 logger.warning("[GJ] %s", msg)
 
             if butterfly_lhs > 4.0:
-                msg = (f"T={T:.4f}: butterfly violated — φ²·(1+|ρ|) = {butterfly_lhs:.4f} > 4")
+                msg = (f"T={T:.4f}: butterfly violated — θ·φ²·(1+|ρ|) ={butterfly_lhs:.4f} > 4")
                 violations.append(msg)
                 logger.warning("[GJ] %s", msg)
 

@@ -1,27 +1,17 @@
 """
-Data quality checks applied to the raw option chain before IV calibration.
+Data quality flags on the option chain (run after BS IV, which the regime needs).
 
-Checks applied in sequence:
-  1. Vol regime detection   — classify ATM IV into low / medium / high regime
-  2. Stale price detection  — flag options with no price or OI movement
-  3. Put-call parity forward check — flag strikes with implied forward diverging from futures
-  4. Minimum liquidity filter — drop expiry slices with too few valid strikes
+  1. vol_regime      — ATM IV: low_vol < 12% ≤ medium_vol < 16% ≤ high_vol
+  2. is_stale        — close and OI unchanged vs the previous day
+  3. pcp_forward_ok  — put-call-parity forward within tolerance of futures
+  4. slice_liquid    — enough liquid strikes in the (type, expiry) slice
 
-Each check adds a boolean column; the final `is_clean` column is the intersection.
-Rows where `is_clean = False` are excluded from IV calibration and SSVI fitting
-but are kept in the DataFrame for diagnostic visibility.
+is_clean is the intersection. Flags are informational: they are stored and
+charted, but do not currently filter the rows used for SSVI/SVI fitting
+(that is iv_valid_for_ssvi, set in BSFitter).
 
-Vol regime flags
-----------------
-  low_vol    ATM IV < 12%   — normal BankNifty conditions
-  medium_vol ATM IV 12–16%  — elevated, consistent with 1–2% daily moves
-  high_vol   ATM IV > 16%   — fear regime, spreads wide, liquidity thin
-
-In high_vol regime the PCP tolerance is widened and the min-OI threshold is
-lowered to avoid stripping too many contracts from an already thin market.
-The high-vol fallback OI threshold reuses Settings.MIN_OI_STOCK (500) — the
-same value used for single-stock options — because both represent thinner,
-less-liquid market conditions.
+In high_vol the PCP tolerance widens (0.5% → 1.0%); the OI threshold drops to
+Settings.MIN_OI_STOCK only when no explicit min_oi is passed.
 """
 
 import logging
@@ -63,17 +53,10 @@ class VolRegime:
 
 class DataQualityChecker:
 
-    # Minimum number of valid strikes per expiry slice to attempt IV calibration
     MIN_STRIKES_PER_EXPIRY: int   = 5
-    # Max fractional deviation of implied forward from futures forward
-    # Widened automatically in high_vol regime (see run())
-    PCP_FORWARD_TOL:        float = 0.005   # 0.5% — normal regime
-    PCP_FORWARD_TOL_HIGH:   float = 0.010   # 1.0% — high_vol regime
-
-    # OI thresholds are sourced from Settings to avoid duplication:
-    #   Settings.MIN_OI_INDEX (1000) — default, used for all normal-regime runs
-    #   Settings.MIN_OI_STOCK  (500) — high-vol fallback; same value because
-    #       thin stress markets resemble single-stock liquidity profiles
+    # Max |F_implied − F_futures| / F_futures
+    PCP_FORWARD_TOL:        float = 0.005   # normal regime
+    PCP_FORWARD_TOL_HIGH:   float = 0.010   # high_vol regime
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -83,32 +66,18 @@ class DataQualityChecker:
         min_oi:   int          | None = None,
     ) -> pd.DataFrame:
         """
-        Run all quality checks. Returns df with added columns:
-            vol_regime        str   — 'low_vol' | 'medium_vol' | 'high_vol'
-            is_stale          bool  — price AND OI unchanged vs previous day
-            pcp_forward_ok    bool  — implied forward within tolerance of futures
-            slice_liquid      bool  — expiry slice has >= MIN_STRIKES_PER_EXPIRY valid rows
-            is_clean          bool  — all three checks pass (use for calibration)
-
-        Pass df with an `implied_volatility` column (i.e. after BSFitter) so
-        that vol-regime detection is based on real calibrated IVs, not defaults.
-
-        In high_vol regime: PCP tolerance is widened (0.5% → 1.0%) and the
-        minimum OI threshold is lowered (1000 → 500) to retain contracts in
-        thin markets without sacrificing data integrity.
+        Add vol_regime, is_stale, pcp_forward_ok, slice_liquid, is_clean.
 
         Args:
-            df:       today's parsed option chain DataFrame (ideally post-BSFitter)
-            prev_df:  yesterday's parsed DataFrame (optional; if None, stale skipped)
-            min_oi:   override minimum OI (uses Settings.MIN_OI_INDEX if None)
+            df:       option chain with implied_volatility (i.e. after BSFitter)
+            prev_df:  previous day's chain; if None the stale check is skipped
+            min_oi:   explicit OI threshold; if None, regime-dependent
         """
         df = df.copy()
 
-        # ── Step 0: Vol regime ────────────────────────────────────────────
         regime = VolRegime.from_df(df)
         df["vol_regime"] = regime
 
-        # Adaptive thresholds based on regime
         effective_pcp_tol = (DataQualityChecker.PCP_FORWARD_TOL_HIGH
                              if regime == VolRegime.HIGH
                              else DataQualityChecker.PCP_FORWARD_TOL)
@@ -116,7 +85,7 @@ class DataQualityChecker:
         if min_oi is not None:
             effective_min_oi = min_oi
         elif regime == VolRegime.HIGH:
-            effective_min_oi = Settings.MIN_OI_STOCK   # relaxed threshold for thin stress market
+            effective_min_oi = Settings.MIN_OI_STOCK
         else:
             effective_min_oi = Settings.MIN_OI_INDEX
 
@@ -148,12 +117,8 @@ class DataQualityChecker:
     @staticmethod
     def _stale_check(df: pd.DataFrame, prev_df: pd.DataFrame | None) -> pd.Series:
         """
-        A contract is stale if BOTH its close price AND open interest are
-        identical to the previous day.  This catches NSE carry-forward fills
-        where no actual trade occurred.
-
-        If no previous-day data is provided, no rows are marked stale
-        (can't know without a reference).
+        Stale = close AND OI identical to the previous day (NSE carry-forward
+        with no trade). No prev_df → nothing marked stale.
         """
         stale = pd.Series(False, index=df.index)
 
@@ -184,16 +149,9 @@ class DataQualityChecker:
     @staticmethod
     def _pcp_check(df: pd.DataFrame, tol: float = None) -> pd.Series:
         """
-        Put-call parity forward check.
-
-        For each (expiry, strike) pair with both a CE and PE:
-            F_implied = K + (C - P) * e^(r*T)
-
-        If |F_implied - F_futures| / F_futures > tol,
-        both the call and put at that strike are flagged.
-
-        tol is passed from run() and may be widened in high_vol regime.
-        Strikes with only one leg (call or put only) are left clean.
+        Put-call parity: F_implied = K + (C − P)·e^{rT} per (expiry, strike).
+        If |F_implied − F_futures| / F_futures > tol, flag both legs.
+        Strikes with only one leg are left clean.
         """
         tol = tol if tol is not None else DataQualityChecker.PCP_FORWARD_TOL
 
@@ -247,12 +205,7 @@ class DataQualityChecker:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _liquidity_check(df: pd.DataFrame, min_oi: int = None) -> pd.Series:
-        """
-        Flag all rows in an expiry slice that has fewer than MIN_STRIKES_PER_EXPIRY
-        distinct strikes with OI >= min_oi.
-
-        We count per (option_type, expiry) since SSVI fitting is per-slice.
-        """
+        """Flag every row of an (option_type, expiry) slice with < MIN_STRIKES_PER_EXPIRY strikes at OI ≥ min_oi."""
         effective_oi = min_oi if min_oi is not None else Settings.MIN_OI_INDEX
         min_strikes  = DataQualityChecker.MIN_STRIKES_PER_EXPIRY
         liquid       = pd.Series(True, index=df.index)

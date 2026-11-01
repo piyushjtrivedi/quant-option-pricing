@@ -8,22 +8,17 @@ from src.pricing_engines.iv_engines.svi_engine.ssvi_helpers import SSVIHelpers
 
 class SSVIConstrainedFitter:
 
-    def __init__(self, iv_df: pd.DataFrame, log_moneyness_grid=None, phi_min_override: float = None,
-                  wing_weight_alpha: float = 2, density_tol: float = -1e8):
+    def __init__(self, iv_df: pd.DataFrame, log_moneyness_grid=None, phi_min_override: float = None):
 
         self.ssvi_params = {}
 
-        # ── Step 1: start from rows already flagged valid for SSVI ────────────
+        # iv_valid_for_ssvi (set in BSFitter) is the single source of truth for fit rows
         if "iv_valid_for_ssvi" in iv_df.columns:
             df = iv_df[iv_df["iv_valid_for_ssvi"]].copy()
         else:
             df = iv_df[
                 iv_df["implied_volatility"].notna() & (iv_df["implied_volatility"] > 0)
             ].copy()
-
-        # No vega filter here — deep-OTM rows are already excluded by the
-        # iv_valid_for_ssvi flag set in BSFitter.  That flag is the single
-        # source of truth for which rows enter calibration, validation, and plots.
 
         self.df = df
         self.time_to_expiry = sorted(self.df["time_to_expiry"].unique().tolist())
@@ -43,18 +38,7 @@ class SSVIConstrainedFitter:
             q = float(group_by_expiry["dividend"].iloc[0])
             self.ips_by_expiry[T] = {"S":S, "r":r, "F" : F, "q" : q}
 
-        #Control parameters
-        self.wing_weight_alpha = wing_weight_alpha
-        self.density_tol = density_tol
-
-        # phi_min: lower bound to prevent degenerate flat-surface solutions (phi→0).
-        # The previous formula phi_min = 0.8/k_span was intended to ensure positive
-        # total variance at the smile wings — but SSVI w(k) is analytically positive
-        # for all k by construction (the sqrt term guarantees it). That formula was
-        # therefore unnecessary, and actively harmful: with k_span=0.23 from the Mar
-        # expiry it floors phi at 3.42, which immediately violates the GJ butterfly
-        # condition phi^2*(1+|rho|) <= 4 for any rho. The optimizer then can't escape.
-        # A flat floor of 0.1 is sufficient — it just prevents phi collapsing to zero.
+        # Floor on phi: stops the optimiser collapsing to a flat smile (phi → 0)
         self.phi_min = phi_min_override if phi_min_override is not None else 0.1
 
     def _unpack(self, x):
@@ -67,22 +51,18 @@ class SSVIConstrainedFitter:
         rho     = math.tanh(rho_un)
         return theta, phi, rho
 
-    def _model_w(self, theta, phi, rho):
-        ks  = self.df["log_moneyness"].values
-        ts  = self.df["time_to_expiry"].values
-        out = np.zeros(len(ks), dtype=float)
-        for i, T in enumerate(self.time_to_expiry):
-            mask      = ts == T
-            out[mask] = SSVIHelpers.ssvi_w(ks[mask], theta[i], phi, rho)
-        return out
-
     def _gj_penalty(self, theta, phi, rho) -> float:
-        """Soft GJ penalty — quadratic cost when conditions violated."""
+        """
+        Soft quadratic penalty for the Gatheral-Jacquier (2014, Thm 4.2) conditions,
+        per expiry with ATM total variance θ:
+            wing:       θ·φ·(1+|ρ|)  < 4
+            butterfly:  θ·φ²·(1+|ρ|) ≤ 4
+        """
         abs_rho = abs(rho)
         penalty = 0.0
         for th in theta:
-            wing      = phi * th  * (1.0 + abs_rho)
-            butterfly = phi ** 2  * (1.0 + abs_rho)
+            wing      = th * phi      * (1.0 + abs_rho)
+            butterfly = th * phi ** 2 * (1.0 + abs_rho)
             if wing > 4.0:
                 penalty += 1e4 * (wing - 4.0) ** 2
             if butterfly > 4.0:
@@ -100,30 +80,16 @@ class SSVIConstrainedFitter:
                 return False
         return True
 
-    # Scale factor applied to the w-space MSE before returning from objective().
-    # Total variance w = sigma^2 * T is O(1e-4) for typical equity options,
-    # so raw MSE is O(1e-7) and its gradient is O(1e-9) — far below L-BFGS-B's
-    # default gtol=1e-5, causing the optimizer to exit at x0 without iterating.
-    # Multiplying by W_SCALE lifts the objective and gradient into a range the
-    # optimizer can act on without changing the solution or tightening gtol
-    # (which would also affect the GJ penalty gradient).
-    # 1e6 brings w-space MSE O(1e-7) → O(0.1), gradients O(1e-9) → O(1e-3),
-    # well above gtol.
+    # Raw w-space MSE is O(1e-7) with gradients O(1e-9), below L-BFGS-B's
+    # default gtol=1e-5, so the optimiser would stop at x0. Scaling by 1e6
+    # lifts gradients to O(1e-3) without changing the minimiser.
     W_SCALE: float = 1e6
 
     def objective(self, x):
         """
-        Scaled MSE in total-variance (w = sigma^2 * T) space, averaged equally
-        across expiries.
-
-        W-space preserves the time-weighting of variance and is the natural
-        metric for SSVI (which is parameterised in w). The raw MSE is O(1e-7),
-        so it is scaled by W_SCALE=1e6 to lift gradients above L-BFGS-B's
-        default gtol=1e-5 — without this the optimizer exits at x0.
-
-        Equal-weight across expiries: per-expiry MSE is averaged rather than
-        pooling all rows. Pooling concentrates weight on the near-dated expiry
-        which has the most strikes, sacrificing far-expiry fit quality.
+        Scaled total-variance MSE, averaged per expiry (not pooled), so the
+        front expiry's many strikes don't dominate the fit. Infeasible
+        (negative-density) surfaces return 1e20.
         """
         theta, phi, rho = self._unpack(x)
         gj_pen = self._gj_penalty(theta, phi, rho)
@@ -151,7 +117,6 @@ class SSVIConstrainedFitter:
         return fit_cost + gj_pen
 
     def fit(self, x0=None, verbose=True):
-        n = len(self.time_to_expiry)
         if x0 is None:
             theta0 = []
             for T in self.time_to_expiry:
@@ -188,16 +153,11 @@ class SSVIConstrainedFitter:
         }
         return self.ssvi_params
 
-    
-    
     def build_ssviNdupire_vol_from_theta_map(self, sigma_floor = 1e-4,smooth_sigma = (0.6, 0.6)):
-        """
-        Compute local volatility analytically from SSVI parameterization
-        """
+        """Build the SSVI surface on a (T, k) grid with analytical Dupire local vol."""
 
         k_grid = self.log_moneyness_grid
         expiries = self.time_to_expiry
-        T_grid = np.linspace(np.min(expiries), np.max(expiries), 20)
         T_grid = np.unique(np.concatenate((np.linspace(np.min(expiries), np.max(expiries), 20),expiries)))
         nk, nT = len(k_grid), len(T_grid)
 
@@ -225,20 +185,19 @@ class SSVIConstrainedFitter:
             w[i, :], iv[i, :], w_k[i, :], w_kk[i, :], w_t[i, :] = \
                 SSVIHelpers.local_iv_from_ssvi_params(k_grid, T_grid[i], theta, theta_dot, phi, rho)
 
-        # Gatheral formula
-        # D = (1 - (k*w_k)) / (2W))^2 + (w_k^2 / 4)*(1/w + 1/4)
+        # Gatheral (2006) eq. 1.10: σ²_loc = w_T / D,
+        # D = (1 - k*w_k/(2w))^2 - (w_k^2/4)*(1/w + 1/4) + w_kk/2
+        # D <= 0 is butterfly arb (local vol undefined) → sigma_floor.
         w_safe = np.maximum(w, 1e-12)
         term1 = 1.0 - ((k_grid[np.newaxis, :] * w_k) / (2.0*w_safe))
         term1_sq = term1*term1
         term2 = 0.25*(w_k*w_k)*(1.0 / w_safe + 0.25)
-        D = term1_sq + term2
-        D = np.maximum(D, 1e-12)
+        D = term1_sq - term2 + 0.5*w_kk
 
-        local_var = w_t/D
+        local_var = np.where(D > 1e-12, w_t / np.maximum(D, 1e-12), np.nan)
         local_var = np.where(np.isfinite(local_var) & (local_var > 0.0), local_var, sigma_floor**2)
         local_var = np.maximum(local_var, sigma_floor**2)
 
-        # optional mild smoothing on local variance grid
         if smooth_sigma is not None:
             local_var = gaussian_filter(local_var, sigma=smooth_sigma, mode='nearest')
 

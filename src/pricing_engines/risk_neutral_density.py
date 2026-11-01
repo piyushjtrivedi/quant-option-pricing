@@ -11,15 +11,23 @@ The Breeden-Litzenberger result states:
     p(K, T) = e^{rT} · ∂²C / ∂K²
 
 Re-expressed in terms of total variance  w(k) = σ²(k)·T  and log-forward
-moneyness  k = log(K / F),  the density in k-space is:
+moneyness  k = log(K / F),  the density of log(S_T/F) is
+(Gatheral & Jacquier 2014, eq. 2.1):
+
+    p(k) = g(k) / √(2π·w) · exp(−d₋² / 2),     d₋ = −k/√w − √w/2
 
     g(k) = [1 - k·w'/(2w)]²  -  (w'²/4)·(1/w + 1/4)  +  w''/2
 
-where  w' = dw/dk  and  w'' = d²w/dk².
+where  w' = dw/dk  and  w'' = d²w/dk².  g(k) ≥ 0 is the butterfly
+no-arbitrage condition.
 
-Converting to strike-space density:
+Converting to strike-space density (K = F·e^k, dk = dK/K):
 
-    f(K) = g(k) / [K · √(2π·w(k))] · e^{-rT}
+    f(K) = p(k) / K
+
+The e^{rT} in Breeden-Litzenberger cancels the discounting inside C, so the
+density itself is undiscounted and integrates to 1 without normalisation
+(the normalised column is kept to absorb truncation of the k-range).
 
 The columns ``dw_dk_svi`` and ``d2w_dk2_svi`` in the calibrated parquet
 provide w' and w'' analytically from the SVI / SSVI surface, so no
@@ -121,12 +129,16 @@ def compute_rnd(
     term3 = w_kk / 2.0
     g     = term1 - term2 + term3
 
-    # ── Convert to strike-space density ──────────────────────────────────────
-    # f(K) = g(k) / [K · √(2π·w)] · e^{-rT}
-    K     = F * np.exp(k)
-    denom = K * np.sqrt(np.maximum(2.0 * np.pi * w, 1e-20))
-    f_K   = np.where(denom > 1e-20, g * np.exp(-r * T) / denom, np.nan)
-    f_K   = np.where(f_K > 0, f_K, np.nan)   # density must be non-negative
+    # ── Density in k, then strike space ───────────────────────────────────────
+    # p(k) = g(k) / √(2π·w) · exp(−d₋²/2),  d₋ = −k/√w − √w/2
+    # f(K) = p(k) / K
+    sqrt_w  = np.sqrt(w)
+    d_minus = -k / sqrt_w - 0.5 * sqrt_w
+    p_k     = g / np.sqrt(2.0 * np.pi * w) * np.exp(-0.5 * d_minus ** 2)
+
+    K   = F * np.exp(k)
+    f_K = np.where(K > 0, p_k / K, np.nan)
+    f_K = np.where(f_K > 0, f_K, np.nan)   # g < 0 → butterfly arb → no density
 
     # ── Normalise: ∫ f(K) dK ≈ 1 (trapezoid) ─────────────────────────────────
     dK   = np.diff(K, prepend=K[0])

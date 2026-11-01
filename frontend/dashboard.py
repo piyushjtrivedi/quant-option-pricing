@@ -5,19 +5,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 
-# ── DEMO MODE toggle ──────────────────────────────────────────────────────────
-# Set DEMO_MODE = True  to serve a pre-baked parquet (no pipeline, no NSE downloads).
-# Set DEMO_MODE = False to run the full live calibration pipeline.
+# True: read the committed parquet (no pipeline, no NSE downloads).
+# False: live calibration — also uncomment the live imports and block below.
 DEMO_MODE = True
 
-# ── DEMO MODE imports (active when DEMO_MODE = True) ─────────────────────────
-# Path to the committed pre-baked parquet. Only used in demo mode.
 DEMO_PARQUET = PROJECT_ROOT / "data" / "processed" / "iv_surfaces" / "BANKNIFTY.parquet"
 
-# ── LIVE MODE imports (active when DEMO_MODE = False) ────────────────────────
-# Comment these back in and set DEMO_MODE = False to restore the live pipeline.
+# ── LIVE MODE imports ─────────────────────────────────────────────────────────
 # from src.api.iv_surface_service import ensure_iv_surface
 # from src.api.ticker_service import fetch_ticker_data
 # from src.config.settings import Settings
@@ -73,7 +68,6 @@ def render_dashboard():
 
     if DEMO_MODE:
         # ── DEMO MODE controls ────────────────────────────────────────────────
-        # Reads dates available in the pre-baked parquet; no pipeline run needed.
         st.info("📦 Demo mode — pre-baked surface snapshot. Set 'DEMO_MODE = False' to enable live calibration.")
         try:
             _demo_full = pd.read_parquet(DEMO_PARQUET)
@@ -81,7 +75,6 @@ def render_dashboard():
             st.error(f"❌ Demo parquet not found at {DEMO_PARQUET}")
             st.stop()
         _demo_dates  = sorted(_demo_full["trade_date"].unique().tolist())
-        _demo_symbol = _demo_full["trade_date"].iloc[0] and "BANKNIFTY"  # single symbol in demo file
 
         with st.container():
             c1, c2 = st.columns([1.2, 0.5])
@@ -104,10 +97,7 @@ def render_dashboard():
                 )
 
     else:
-        # ── LIVE MODE controls ────────────────────────────────────────────────
-        # Comment this block back in (and set DEMO_MODE = False) to enable the
-        # full live calibration pipeline with NSE bhavcopy downloads.
-        #
+        # ── LIVE MODE controls (uncomment to enable) ──────────────────────────
         # ticker_df  = _load_ticker_data()
         # symbol_list = ticker_df["TckrSymb"].tolist()
         # symbol_to_instrument = dict(zip(ticker_df["TckrSymb"], ticker_df["instrument_type"]))

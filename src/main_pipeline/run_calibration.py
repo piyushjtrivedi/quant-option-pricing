@@ -59,7 +59,7 @@ def _resolve_paths(date_str: str, symbol: str) -> dict:
         zip_path = bhav_client.download(dt)
         bhavcopy = bhav_extractor.extract(zip_path)
 
-    # Ensure the date is cached in the consolidated mibor.csv (Tier 1→2→3 lookup)
+    # Ensure the date is in mibor.csv (local file, then RBI Excel)
     SpotRateClient().get_rates_for_date(dt)
     single_mibor = base / "mibor" / "mibor.csv"
     mibor = single_mibor if single_mibor.exists() else None
@@ -105,9 +105,7 @@ def calibrate(
     logger.info("[Paths] Bhavcopy : %s", paths["bhavcopy"])
     logger.info("[Paths] MIBOR    : %s", paths["mibor"])
 
-    # ── 2. Parse market data ──────────────────────────────────────────────────
-    # BhavcopyParser caches the CSV internally so parse_to_futures_df reuses the
-    # same in-memory DataFrame instead of reading the file a second time.
+    # ── 2. Parse market data (parser caches the CSV, so it is read once) ─────
     bhav_parser = BhavcopyParser(symbol=symbol, instrument_type=instrument)
     oc_df       = bhav_parser.parse_to_dataframe(str(paths["bhavcopy"]))
     ir_df       = InterestRateParser.parse_to_dataframe(str(paths["mibor"]), date_str)
@@ -126,18 +124,14 @@ def calibrate(
     dividend_fitter = DividendFitter(futures_df["time_to_expiry"], futures_df["dividend"])
     logger.info("[Rates] NSS curve fitted | %d dividend tenors", len(futures_df))
 
-    # ── 4. BS IV calibration ──────────────────────────────────────────────────
-    # Must come before DataQualityChecker so vol-regime detection (which requires
-    # implied_volatility) uses real ATM IVs instead of defaulting to low_vol.
+    # ── 4. BS IV calibration — before data quality, which needs IVs for the vol regime
     logger.info("[BS IV] Starting IV calibration ...")
     iv_bs_df = BSFitter.fit(oc_df, nss_fitted_curve, dividend_fitter)
     n_raw_iv = int(iv_bs_df.get("iv_valid_for_ssvi", iv_bs_df["implied_volatility"].notna()).sum())
     n_interp = int(iv_bs_df.get("iv_interpolated",   pd.Series([False])).sum())
     logger.info("[BS IV] %d raw IVs | %d interpolated gap-fills", n_raw_iv, n_interp)
 
-    # ── 5. Data quality (single pass, correct vol regime) ────────────────────
-    # iv_bs_df carries implied_volatility so VolRegime.from_df() detects the real
-    # regime and adaptive OI / PCP thresholds are applied in one pass.
+    # ── 5. Data quality flags (regime-adaptive thresholds) ────────────────────
     iv_bs_df = DataQualityChecker.run(iv_bs_df, prev_df=None,
                                       min_oi=Settings.min_oi(instrument))
     vol_regime = iv_bs_df["vol_regime"].iloc[0] if "vol_regime" in iv_bs_df.columns else "low_vol"
@@ -189,31 +183,26 @@ def calibrate(
         on=["time_to_expiry", "log_moneyness"], how="left",
     )
 
-    # ── 7. Back-compute strike from log-moneyness — fully vectorised ──────────
+    # ── 7. Back-compute strike from log-moneyness: K = S·e^k·e^{(r−q)T} ───────
     underlying_value = float(iv_bs_df["underlying_value"].iloc[0])
     T_vals    = iv_svi_df["time_to_expiry"].values
     k_vals    = iv_svi_df["log_moneyness"].values
-    r_vals    = nss_fitted_curve(T_vals) / 100          # NSS accepts arrays
-    q_vals    = dividend_fitter.forecast(T_vals)         # DividendFitter already vectorised
+    r_vals    = nss_fitted_curve(T_vals) / 100
+    q_vals    = dividend_fitter.forecast(T_vals)
     strikes   = np.exp(k_vals) * underlying_value * np.exp((r_vals - q_vals) * T_vals)
     iv_svi_df["strike"] = np.round(strikes).astype(int)
 
-    # ── 8. Interpolate BS IV onto surface grid ────────────────────────────────
-    logger.info("[BSGrid] Interpolating BS IV onto SSVI grid ...")
-    iv_svi_df = BSFitter.interpolate_bs_iv_onto_svi_grid(iv_bs_df, iv_svi_df)
-
-    # ── 9. Merge market data ──────────────────────────────────────────────────
+    # ── 8. Merge market data onto grid points that match a traded contract ────
     iv_svi_df = iv_svi_df.merge(
         iv_bs_df, on=["time_to_expiry", "log_moneyness", "strike"], how="left"
     )
 
-    # ── 10. Validate SSVI fit quality ─────────────────────────────────────────
+    # ── 9. Validate SSVI fit quality ──────────────────────────────────────────
     logger.info("[Validate] Running SSVI quality checks ...")
     report = SSVIValidator.check_fit_quality(
-        iv_bs_df, ssvi_params, ssvi_fitter,
+        iv_bs_df, ssvi_params,
         svi_rmse_vpts=svi_report.overall_rmse_vpts,
     )
-    # report.log() inside check_fit_quality already emits per-expiry RMSE and GJ lines
     iv_svi_df["ssvi_rmse_vpts"]    = round(report.overall_rmse_vpts, 4)
     iv_svi_df["ssvi_fit_ok"]       = report.fit_acceptable
     iv_svi_df["gj_violations"]     = len(report.gj_violations)
@@ -228,18 +217,16 @@ def calibrate(
     iv_svi_df["svi_calendar_ok"]         = len(svi_report.calendar_violations) == 0
     iv_svi_df["svi_calendar_violations"] = len(svi_report.calendar_violations)
 
-    # ── 11. Save ──────────────────────────────────────────────────────────────
+    # ── 10. Save ──────────────────────────────────────────────────────────────
     base_cols = [
         "time_to_expiry", "strike", "log_moneyness",
-        # Market data — needed by signal engine and OI charts
+        # Market data
         "option_type", "open_interest", "close",
         "underlying_value", "interest_rate", "dividend",
         "futures_close",
         # BS IV
         "implied_volatility", "iv_interpolated", "iv_valid_for_ssvi",
         "bs_implied_variance", "dw_dk_bs", "d2w_dk2_bs", "dw_dT_bs",
-        # BS IV interpolated on SSVI grid
-        "implied_volatility_bs_grid",
         # SSVI surface
         "implied_volatility_svi", "implied_variance_svi",
         "dw_dT_svi", "dw_dk_svi", "d2w_dk2_svi",

@@ -1,5 +1,4 @@
 import logging
-import os
 from src.config.settings import Settings
 from src.utils.storage import ParquetSaver
 

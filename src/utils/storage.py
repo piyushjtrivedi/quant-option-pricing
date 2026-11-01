@@ -23,20 +23,9 @@ class ParquetSaver:
         symbol: str = None,
     ) -> str:
         """
-        Upsert the calibrated surface for (symbol, trade_date) into the
-        single per-symbol parquet at processed/iv_surfaces/{symbol}.parquet.
-
-        Behaviour
-        ---------
-        - Stamps a `trade_date` column on every row before writing.
-        - Drops any existing rows for that date (handles both new inserts and
-          force-recompute overwrites — caller decides when to call).
-        - Appends the new rows and re-sorts by (trade_date, time_to_expiry,
-          log_moneyness) so the file stays in a predictable order.
-
-        Returns
-        -------
-        str — path to the symbol parquet file.
+        Upsert one date into processed/iv_surfaces/{symbol}.parquet: stamp
+        trade_date, replace any existing rows for that date, re-sort by
+        (trade_date, time_to_expiry, log_moneyness). Returns the file path.
         """
         sym = symbol or Settings.DEFAULT_SYMBOL
         os.makedirs(_IV_SURFACE_DIR, exist_ok=True)
@@ -85,15 +74,3 @@ class ParquetSaver:
             return None
         slice_df = df[df["trade_date"] == trade_date].reset_index(drop=True)
         return slice_df if not slice_df.empty else None
-
-    @staticmethod
-    def save_impliedvols_to_parquet(
-        df: pd.DataFrame, trade_date: str, symbol: str = None
-    ) -> str:
-        sym = symbol or Settings.DEFAULT_SYMBOL
-        output_dir = os.path.join(Settings.DATA_DIR, f"processed/{sym}/{trade_date}")
-        os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, "ivs.parquet")
-        df.to_parquet(path, index=False)
-        logger.info("[Storage] Implied vols parquet saved: %s/ivs.parquet", trade_date)
-        return path

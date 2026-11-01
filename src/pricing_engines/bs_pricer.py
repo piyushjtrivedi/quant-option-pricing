@@ -17,16 +17,7 @@ class BlackScholes:
             return S*np.exp(-q*T)*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
         else:
             return K*np.exp(-r*T)*norm.cdf(-d2) - S*np.exp(-q*T)*norm.cdf(-d1)
-    
-    @staticmethod
-    def bs_delta(S, K, r, q, T, sigma, flag):
-        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
 
-        if flag.lower() == 'c':
-            return norm.cdf(d1)
-        else:
-            return norm.cdf(-d1)
-        
     @staticmethod
     def bs_vega(S, K, r, q, T, sigma):
         d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
